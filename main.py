@@ -2,149 +2,97 @@ import json
 import requests
 from flask import Flask, request
 import logging
-import time
+import re
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-def check_rate_limit(response_headers):
-    """Check rate limit and determine if we need to pause."""
-    try:
-        remaining = int(response_headers.get('x-ratelimit-remaining', 0))
-        logging.info(f"Rate limit remaining: {remaining}")
-        
-        if remaining < 50:
-            logging.info("Rate limit below 50, pausing for 5 seconds")
-            time.sleep(5)
-            return True
-        return False
-    except (ValueError, TypeError) as e:
-        logging.error(f"Error parsing rate limit header: {e}")
-        return False
-
-def handle_api_call(api_url, headers, payload, field_name, max_retries=3):
-    """Make API call with rate limit handling and retries."""
-    for attempt in range(max_retries):
-        try:
-            response = requests.put(api_url, headers=headers, json=payload)
-            
-            # Check rate limit headers
-            check_rate_limit(response.headers)
-            
-            # If successful, return the response
-            if response.status_code == 200:
-                return response
-            
-            # Handle rate limit exceeded
-            if response.status_code == 429:
-                logging.warning("Rate limit exceeded, waiting 10 seconds")
-                time.sleep(10)
-                continue
-                
-            # If other error, raise it
-            response.raise_for_status()
-            
-        except requests.exceptions.RequestException as e:
-            if attempt == max_retries - 1:  # Last attempt
-                raise
-            
-            if hasattr(e.response, 'status_code') and e.response.status_code == 429:
-                logging.warning("Rate limit exceeded, waiting 10 seconds")
-                time.sleep(10)
-                continue
-                
-            logging.error(f"Error updating field {field_name}, attempt {attempt + 1}: {e}")
-            time.sleep(2)  # Brief pause before retry
-    
-    raise Exception(f"Failed to update field after {max_retries} attempts")
-
 @app.route("/", methods=["POST"])
-def restore_custom_fields():
-    """Restores custom field options in GoHighLevel."""
+def filter_custom_fields():
+    """Filters custom fields from GoHighLevel API based on prefix and field names."""
     try:
-        request_json = request.get_json()
-        logging.info("Received request")
+        # Log the raw request data
+        raw_data = request.get_data()
+        logging.info(f"Raw request data: {raw_data.decode('utf-8')}")
+        
+        try:
+            request_json = request.get_json()
+            logging.info(f"Parsed JSON data: {json.dumps(request_json, indent=2)}")
+        except Exception as e:
+            logging.error(f"Error parsing JSON: {e}")
+            return ("Invalid request: JSON parsing error", 400)
 
-        required_keys = ('version', 'locationId', 'access_token', 'restore_fields')
-        if not request_json or not all(key in request_json for key in required_keys):
-            return ("Invalid request: Missing required parameters", 400)
+        if not request_json:
+            logging.error("Request body is empty")
+            return ("Invalid request: Empty body", 400)
 
-        # Extract basic parameters
+        required_keys = ('prefix', 'field_names', 'locationId', 'access_token', 'version')
+        missing_keys = [key for key in required_keys if key not in request_json]
+        if missing_keys:
+            logging.error(f"Missing required keys: {missing_keys}")
+            return (f"Invalid request: Missing required parameters: {', '.join(missing_keys)}", 400)
+
+        prefix = request_json['prefix']
+        field_names = [name.lower().replace('\u00a0', ' ').strip() for name in request_json['field_names']]
         location_id = request_json['locationId']
         access_token = request_json['access_token']
         version = request_json['version']
 
-        # Parse the restore_fields string
-        try:
-            restore_data = json.loads(request_json['restore_fields'])
-            fields_to_restore = restore_data.get('Restore', [])
-            logging.info(f"Found {len(fields_to_restore)} fields to restore")
-        except json.JSONDecodeError as e:
-            logging.error(f"Error parsing restore_fields: {e}")
-            return ("Invalid restore_fields format", 400)
+        logging.info(f"Processing request for prefix: {prefix}")
+        logging.info(f"Looking for field names (normalized): {field_names}")
 
-        # Setup API headers
+        api_url = f"https://services.leadconnectorhq.com/locations/{location_id}/customFields"
         api_headers = {
             'Accept': 'application/json',
-            'Content-Type': 'application/json',
             'Authorization': f'Bearer {access_token}',
             'Version': version
         }
 
-        results = []
-        for field in fields_to_restore:
-            field_id = field.get('id')
-            field_name = field.get('name')
-            options = field.get('picklistOptions', [])
+        response = requests.get(api_url, headers=api_headers)
+        response.raise_for_status()
 
-            if not all([field_id, field_name, options]):
-                logging.warning(f"Skipping field due to missing data: {field}")
+        data = response.json()
+        custom_fields = data.get('customFields', [])
+        logging.info(f"Retrieved {len(custom_fields)} custom fields from API")
+
+        filtered_fields = []
+
+        for field in custom_fields:
+            field_name = field.get('name', '')
+            if not field_name:
                 continue
 
-            api_url = f"https://services.leadconnectorhq.com/locations/{location_id}/customFields/{field_id}"
-            payload = {
-                "name": field_name,
-                "options": options
-            }
+            logging.info(f"\nChecking field: {field_name}")
+
+            if not (field_name.startswith(f"{prefix} - ") or 
+                   any(field_name.startswith(f"{prefix}-A{i} - ") for i in range(10))):
+                logging.info(f"Skipping {field_name} - prefix doesn't match")
+                continue
 
             try:
-                logging.info(f"Updating field {field_name} with ID {field_id}")
-                response = handle_api_call(api_url, api_headers, payload, field_name)
+                base_field_name = field_name.split(" - ", 1)[1]
+                base_field_name = base_field_name.replace('\u00a0', ' ').strip()
+                logging.info(f"Base field name (normalized): {base_field_name}")
                 
-                results.append({
-                    "id": field_id,
-                    "name": field_name,
-                    "status": "success",
-                    "statusCode": response.status_code,
-                    "rateLimit": response.headers.get('x-ratelimit-remaining', 'unknown')
-                })
-                logging.info(f"Successfully updated field {field_name}")
-
+                if base_field_name.lower() in field_names:
+                    logging.info(f"Found matching field name: {base_field_name}")
+                    
+                    if 'picklistOptions' in field and isinstance(field['picklistOptions'], list):
+                        filtered_fields.append({
+                            "id": field.get('id', ''),
+                            "name": field_name,
+                            "picklistOptions": field['picklistOptions']
+                        })
+                        logging.info(f"Added to results with options: {field['picklistOptions']}")
+                    else:
+                        logging.info(f"Field {field_name} has no valid picklistOptions")
+                else:
+                    logging.info(f"Base field name {base_field_name.lower()} not in target list {field_names}")
             except Exception as e:
-                error_message = str(e)
-                error_detail = "No detail available"
-                
-                if isinstance(e, requests.exceptions.RequestException) and e.response:
-                    try:
-                        error_detail = e.response.json()
-                    except:
-                        error_detail = e.response.text
+                logging.error(f"Error processing field {field_name}: {e}")
+                logging.exception("Full exception details:")
 
-                results.append({
-                    "id": field_id,
-                    "name": field_name,
-                    "status": "error",
-                    "error": error_message,
-                    "errorDetail": error_detail
-                })
-                logging.error(f"Error updating field {field_name}: {error_message}")
-
-        response_data = {
-            "results": results,
-            "total_processed": len(results),
-            "successful": len([r for r in results if r.get("status") == "success"]),
-            "failed": len([r for r in results if r.get("status") == "error"])
-        }
+        response_data = {"Restore": filtered_fields}
 
         response_headers = {
             'Access-Control-Allow-Origin': '*',
@@ -153,8 +101,14 @@ def restore_custom_fields():
             'Access-Control-Max-Age': '3600'
         }
 
-        logging.info(f"Completed processing with results: {json.dumps(response_data, indent=2)}")
+        logging.info(f"Final filtered fields count: {len(filtered_fields)}")
+        logging.info(f"Final filtered fields: {json.dumps(filtered_fields, indent=2)}")
+        
         return (json.dumps(response_data), 200, response_headers)
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request error: {e}")
+        return (f"Error fetching custom fields: {e}", 500)
 
     except Exception as e:
         logging.exception("An unexpected error occurred")
