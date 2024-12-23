@@ -7,6 +7,22 @@ import re
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
+def unescape_json_string(s):
+    """Recursively unescape a JSON string that has been escaped multiple times."""
+    prev = None
+    current = s
+    while prev != current:
+        prev = current
+        try:
+            current = json.loads(current)
+            if isinstance(current, str):
+                continue
+            else:
+                return current
+        except:
+            return prev
+    return current
+
 @app.route("/", methods=["POST"])
 def filter_custom_fields():
     """Filters custom fields from GoHighLevel API based on prefix and field names."""
@@ -39,11 +55,13 @@ def filter_custom_fields():
         # Extract restore_fields if it exists and parse it
         if 'restore_fields' in request_json:
             try:
-                restore_fields = json.loads(request_json['restore_fields'].replace('\\"', '"'))
+                # Handle the multiple-escaped JSON string
+                restore_fields = unescape_json_string(request_json['restore_fields'])
                 logging.info(f"Parsed restore_fields: {json.dumps(restore_fields, indent=2)}")
                 return (json.dumps(restore_fields), 200)
             except Exception as e:
                 logging.error(f"Error parsing restore_fields: {e}")
+                logging.exception("Full exception details:")
                 return ("Error parsing restore_fields", 400)
 
         required_keys = ('prefix', 'field_names', 'locationId', 'access_token', 'version')
