@@ -16,8 +16,18 @@ def filter_custom_fields():
         logging.info(f"Raw request data: {raw_data.decode('utf-8')}")
         
         try:
-            request_json = request.get_json()
-            logging.info(f"Parsed JSON data: {json.dumps(request_json, indent=2)}")
+            # Parse the outer JSON structure
+            request_data = request.get_json()
+            logging.info(f"Outer JSON structure: {json.dumps(request_data, indent=2)}")
+            
+            # Extract and parse the inner JSON string
+            if isinstance(request_data, list) and len(request_data) > 0:
+                inner_json_str = request_data[0].get('json', '{}')
+                request_json = json.loads(inner_json_str)
+                logging.info(f"Inner JSON structure: {json.dumps(request_json, indent=2)}")
+            else:
+                request_json = request_data
+            
         except Exception as e:
             logging.error(f"Error parsing JSON: {e}")
             return ("Invalid request: JSON parsing error", 400)
@@ -25,6 +35,16 @@ def filter_custom_fields():
         if not request_json:
             logging.error("Request body is empty")
             return ("Invalid request: Empty body", 400)
+
+        # Extract restore_fields if it exists and parse it
+        if 'restore_fields' in request_json:
+            try:
+                restore_fields = json.loads(request_json['restore_fields'].replace('\\"', '"'))
+                logging.info(f"Parsed restore_fields: {json.dumps(restore_fields, indent=2)}")
+                return (json.dumps(restore_fields), 200)
+            except Exception as e:
+                logging.error(f"Error parsing restore_fields: {e}")
+                return ("Error parsing restore_fields", 400)
 
         required_keys = ('prefix', 'field_names', 'locationId', 'access_token', 'version')
         missing_keys = [key for key in required_keys if key not in request_json]
