@@ -2,16 +2,68 @@ import json
 import requests
 from flask import Flask, request
 import logging
+import time
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
+
+def check_rate_limit(response_headers):
+    """Check rate limit and determine if we need to pause."""
+    try:
+        remaining = int(response_headers.get('x-ratelimit-remaining', 0))
+        logging.info(f"Rate limit remaining: {remaining}")
+        
+        if remaining < 50:
+            logging.info("Rate limit below 50, pausing for 5 seconds")
+            time.sleep(5)
+            return True
+        return False
+    except (ValueError, TypeError) as e:
+        logging.error(f"Error parsing rate limit header: {e}")
+        return False
+
+def handle_api_call(api_url, headers, payload, field_name, max_retries=3):
+    """Make API call with rate limit handling and retries."""
+    for attempt in range(max_retries):
+        try:
+            response = requests.put(api_url, headers=headers, json=payload)
+            
+            # Check rate limit headers
+            check_rate_limit(response.headers)
+            
+            # If successful, return the response
+            if response.status_code == 200:
+                return response
+            
+            # Handle rate limit exceeded
+            if response.status_code == 429:
+                logging.warning("Rate limit exceeded, waiting 10 seconds")
+                time.sleep(10)
+                continue
+                
+            # If other error, raise it
+            response.raise_for_status()
+            
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:  # Last attempt
+                raise
+            
+            if hasattr(e.response, 'status_code') and e.response.status_code == 429:
+                logging.warning("Rate limit exceeded, waiting 10 seconds")
+                time.sleep(10)
+                continue
+                
+            logging.error(f"Error updating field {field_name}, attempt {attempt + 1}: {e}")
+            time.sleep(2)  # Brief pause before retry
+    
+    raise Exception(f"Failed to update field after {max_retries} attempts")
 
 @app.route("/", methods=["POST"])
 def restore_custom_fields():
     """Restores custom field options in GoHighLevel."""
     try:
         request_json = request.get_json()
-        logging.info(f"Received request")
+        logging.info("Received request")
 
         required_keys = ('version', 'locationId', 'access_token', 'restore_fields')
         if not request_json or not all(key in request_json for key in required_keys):
@@ -22,7 +74,7 @@ def restore_custom_fields():
         access_token = request_json['access_token']
         version = request_json['version']
 
-        # Parse the restore_fields string (it's a JSON string within JSON)
+        # Parse the restore_fields string
         try:
             restore_data = json.loads(request_json['restore_fields'])
             fields_to_restore = restore_data.get('Restore', [])
@@ -49,10 +101,7 @@ def restore_custom_fields():
                 logging.warning(f"Skipping field due to missing data: {field}")
                 continue
 
-            # Construct the API URL for this field
             api_url = f"https://services.leadconnectorhq.com/locations/{location_id}/customFields/{field_id}"
-
-            # Prepare the payload
             payload = {
                 "name": field_name,
                 "options": options
@@ -60,23 +109,26 @@ def restore_custom_fields():
 
             try:
                 logging.info(f"Updating field {field_name} with ID {field_id}")
-                response = requests.put(api_url, headers=api_headers, json=payload)
-                response.raise_for_status()
+                response = handle_api_call(api_url, api_headers, payload, field_name)
                 
                 results.append({
                     "id": field_id,
                     "name": field_name,
                     "status": "success",
-                    "statusCode": response.status_code
+                    "statusCode": response.status_code,
+                    "rateLimit": response.headers.get('x-ratelimit-remaining', 'unknown')
                 })
                 logging.info(f"Successfully updated field {field_name}")
 
-            except requests.exceptions.RequestException as e:
+            except Exception as e:
                 error_message = str(e)
-                try:
-                    error_detail = e.response.json() if e.response else "No detail available"
-                except:
-                    error_detail = "Could not parse error response"
+                error_detail = "No detail available"
+                
+                if isinstance(e, requests.exceptions.RequestException) and e.response:
+                    try:
+                        error_detail = e.response.json()
+                    except:
+                        error_detail = e.response.text
 
                 results.append({
                     "id": field_id,
