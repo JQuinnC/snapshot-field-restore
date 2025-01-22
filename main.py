@@ -28,7 +28,6 @@ def update_custom_field(location_id, field_id, field_name, options, access_token
     """Update a custom field with new options, handling rate limits."""
     api_url = f"https://services.leadconnectorhq.com/locations/{location_id}/customFields/{field_id}"
     
-    # Set up headers according to API documentation
     headers = {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
@@ -36,7 +35,6 @@ def update_custom_field(location_id, field_id, field_name, options, access_token
         'Version': version
     }
 
-    # Prepare payload with required fields
     payload = {
         "name": field_name,
         "options": options
@@ -48,7 +46,6 @@ def update_custom_field(location_id, field_id, field_name, options, access_token
 
     while True:
         try:
-            # Use PUT method as specified in documentation
             response = requests.put(api_url, headers=headers, json=payload)
             
             # Log response details
@@ -56,7 +53,6 @@ def update_custom_field(location_id, field_id, field_name, options, access_token
             logging.info(f"Response headers: {dict(response.headers)}")
             logging.info(f"Response body: {response.text}")
             
-            # Check rate limit
             remaining = int(response.headers.get('x-ratelimit-remaining', '1000'))
             logging.info(f"Rate limit remaining: {remaining}")
             
@@ -64,20 +60,34 @@ def update_custom_field(location_id, field_id, field_name, options, access_token
                 logging.info("Rate limit low, waiting 10 seconds")
                 time.sleep(10)
             
-            if response.status_code == 429:  # Rate limit exceeded
+            if response.status_code == 429:
                 logging.warning("Rate limit exceeded, waiting 10 seconds")
                 time.sleep(10)
                 continue
                 
             response.raise_for_status()
-            return True
+            # Return both success status and response details
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "response_body": response.text,
+                "api_url": api_url,
+                "sent_payload": payload
+            }
             
         except requests.exceptions.RequestException as e:
             logging.error(f"Error updating custom field {field_id}: {e}")
             if hasattr(response, 'status_code') and response.status_code == 429:
                 time.sleep(10)
                 continue
-            return False
+            return {
+                "success": False,
+                "error": str(e),
+                "status_code": getattr(response, 'status_code', None),
+                "response_body": getattr(response, 'text', None),
+                "api_url": api_url,
+                "sent_payload": payload
+            }
 
 @app.route("/", methods=["POST"])
 def filter_custom_fields():
@@ -127,17 +137,17 @@ def filter_custom_fields():
             
             # Process each field in restore_fields
             update_results = []
-            for field in restore_fields.get('Restore', []):
-                field_id = field.get('id')
-                field_name = field.get('name')
-                options = field.get('picklistOptions', [])
+            for field in restore_fields.get('fields', []):
+                field_id = field.get('fieldId')
+                field_name = field.get('fieldName')
+                options = field.get('options', [])
                 
                 logging.info(f"Processing field update:")
                 logging.info(f"Field ID: {field_id}")
                 logging.info(f"Field Name: {field_name}")
                 logging.info(f"Options: {options}")
                 
-                success = update_custom_field(
+                result = update_custom_field(
                     location_id=location_id,
                     field_id=field_id,
                     field_name=field_name,
@@ -148,7 +158,8 @@ def filter_custom_fields():
                 
                 update_results.append({
                     "field_name": field_name,
-                    "success": success
+                    "field_id": field_id,
+                    "result": result
                 })
             
             response_data = {"updates": update_results}
